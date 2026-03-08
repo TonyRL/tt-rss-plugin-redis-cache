@@ -892,7 +892,7 @@ class Redis_Cache extends Plugin implements IHandler {
 					<td><?= Config::get(self::REDIS_FEED_TREE_TTL) ?>s</td>
 				</tr>
 				<tr>
-					<td><?= __('Feed icons') ?></td>
+					<td><?= __('Icon') ?></td>
 					<td><?= Config::get(self::REDIS_FEED_ICONS_TTL) ?>s</td>
 				</tr>
 				<tr>
