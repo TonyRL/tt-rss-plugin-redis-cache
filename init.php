@@ -96,8 +96,8 @@ class Redis_Cache extends Plugin implements IHandler {
 		Config::add(self::REDIS_FEED_TREE_TTL, '300', Config::T_STRING);
 		Config::add(self::REDIS_VIEW_TTL, '60', Config::T_STRING);
 		Config::add(self::REDIS_RUNTIME_INFO_TTL, '10', Config::T_STRING);
-		Config::add(self::REDIS_LABELS_TTL, '60', Config::T_STRING);
-		Config::add(self::REDIS_FEED_ICONS_TTL, '3600', Config::T_STRING);
+		Config::add(self::REDIS_LABELS_TTL, '300', Config::T_STRING);
+		Config::add(self::REDIS_FEED_ICONS_TTL, '86400', Config::T_STRING);
 
 		if (!$this->connect()) {
 			return;

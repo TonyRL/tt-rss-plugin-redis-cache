@@ -42,14 +42,14 @@ TTRSS_REDIS_URL=redis://default:secretpass@redis.example.com:6380/0
 
 ### Cache TTL Settings (seconds)
 
-| Variable                        | Description                      | Default             |
-| ------------------------------- | -------------------------------- | ------------------- |
-| `TTRSS_REDIS_COUNTERS_TTL`      | Article counters                 | `30`                |
-| `TTRSS_REDIS_VIEW_TTL`          | Headlines view                   | `60` (1 minute)     |
-| `TTRSS_REDIS_RUNTIME_INFO_TTL`  | Runtime info                     | `10`                |
-| `TTRSS_REDIS_LABELS_TTL`        | User labels                      | `60` (1 minute)     |
-| `TTRSS_REDIS_INIT_PARAMS_TTL`   | Init params                      | `300` (5 minutes)   |
-| `TTRSS_REDIS_FEED_TREE_TTL`     | Feed tree / category hierarchy   | `300` (5 minutes)   |
-| `TTRSS_REDIS_FEED_ICONS_TTL`    | Feed icon existence              | `3600` (1 hour)     |
-| `TTRSS_REDIS_TRANSLATIONS_TTL`  | Translation strings              | `86400` (24 hours)  |
+| Variable                       | Default | Description                                                                                                                                                                                                        |
+| ------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `TTRSS_REDIS_COUNTERS_TTL`     | `30`    | Unread/starred/label counts shown in the feed tree sidebar. Polled by the client every \~60s. A low TTL keeps badge counts responsive; a higher value reduces DB load from the aggregation queries.                |
+| `TTRSS_REDIS_VIEW_TTL`         | `60`    | The full headline list response (first page, non-search). Cached per feed/category/view-mode combination. Invalidated automatically on catchup, mark, and publish actions.                                         |
+| `TTRSS_REDIS_RUNTIME_INFO_TTL` | `10`    | Lightweight metadata returned with every response: feed count, daemon status, error log count, and label definitions. Kept very short so daemon health checks stay accurate.                                       |
+| `TTRSS_REDIS_LABELS_TTL`       | `300`   | The list of label definitions (id, caption, colors) for a user, used in runtime info and article rendering. Invalidated on label assign/remove.                                                                    |
+| `TTRSS_REDIS_INIT_PARAMS_TTL`  | `300`   | Startup parameters sent during sanity check: theme, user prefs, enabled plugins, hotkeys. Only changes when preferences are saved or plugins are toggled.                                                          |
+| `TTRSS_REDIS_FEED_TREE_TTL`    | `300`   | The full feed/category tree structure shown in the sidebar and preferences. Also used for the cached category parent-child hierarchy. Invalidated on feed subscribe/remove and category add/remove/rename/reorder. |
+| `TTRSS_REDIS_FEED_ICONS_TTL`   | `86400` | A map of feed ID to whether a favicon file exists on disk. Icons change only when the update daemon fetches new ones, so a long TTL is safe. Invalidated on feed structure changes.                                |
+| `TTRSS_REDIS_TRANSLATIONS_TTL` | `86400` | All UI translation strings for the user's language. Only changes on tt-rss update or language switch, so a 24-hour TTL is appropriate. Invalidated when the user changes their language preference.                |
 
