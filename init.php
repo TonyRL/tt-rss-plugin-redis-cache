@@ -8,7 +8,6 @@ class Redis_Cache extends Plugin implements IHandler {
 	const REDIS_PASSWORD = 'REDIS_PASSWORD';
 
 	const REDIS_COUNTERS_TTL = 'REDIS_COUNTERS_TTL';
-	const REDIS_TRANSLATIONS_TTL = 'REDIS_TRANSLATIONS_TTL';
 	const REDIS_INIT_PARAMS_TTL = 'REDIS_INIT_PARAMS_TTL';
 	const REDIS_FEED_TREE_TTL = 'REDIS_FEED_TREE_TTL';
 	const REDIS_VIEW_TTL = 'REDIS_VIEW_TTL';
@@ -90,12 +89,11 @@ class Redis_Cache extends Plugin implements IHandler {
 		Config::add(self::REDIS_DB, '0', Config::T_STRING);
 		Config::add(self::REDIS_PASSWORD, '', Config::T_STRING);
 
-		Config::add(self::REDIS_COUNTERS_TTL, '30', Config::T_STRING);
-		Config::add(self::REDIS_TRANSLATIONS_TTL, '86400', Config::T_STRING);
+		Config::add(self::REDIS_COUNTERS_TTL, '120', Config::T_STRING);
 		Config::add(self::REDIS_INIT_PARAMS_TTL, '300', Config::T_STRING);
 		Config::add(self::REDIS_FEED_TREE_TTL, '300', Config::T_STRING);
 		Config::add(self::REDIS_VIEW_TTL, '60', Config::T_STRING);
-		Config::add(self::REDIS_RUNTIME_INFO_TTL, '10', Config::T_STRING);
+		Config::add(self::REDIS_RUNTIME_INFO_TTL, '30', Config::T_STRING);
 		Config::add(self::REDIS_LABELS_TTL, '300', Config::T_STRING);
 		Config::add(self::REDIS_FEED_ICONS_TTL, '86400', Config::T_STRING);
 
@@ -103,7 +101,7 @@ class Redis_Cache extends Plugin implements IHandler {
 			return;
 		}
 
-		// register wildcard overrides — catchall() forwards unhandled methods
+		// register wildcard overrides catchall() forwards unhandled methods
 		$host->add_handler('rpc', '*', $this);
 		$host->add_handler('pref_feeds', '*', $this);
 		$host->add_handler('pref_prefs', '*', $this);
@@ -202,14 +200,8 @@ class Redis_Cache extends Plugin implements IHandler {
 		return (int) Config::get($config_key);
 	}
 
-	private function invalidate_pref_dependent_caches(bool $include_translations = false): void {
-		$keys = ['init_params', 'runtime_info', 'view:*', 'feedtree:*'];
-
-		if ($include_translations) {
-			$keys[] = 'translations';
-		}
-
-		$this->invalidate(...$keys);
+	private function invalidate_pref_dependent_caches(): void {
+		$this->invalidate('init_params', 'runtime_info', 'view:*', 'feedtree:*');
 	}
 
 	private function delegate_and_invalidate(string $class, string $method, string ...$types): void {
@@ -312,15 +304,11 @@ class Redis_Cache extends Plugin implements IHandler {
 	}
 
 	/**
-	 * Cache the complete category hierarchy for the current user.
-	 * @return array<string, int> mapping cat_id => parent_cat (0 for root)
+	 * Fetch the complete category hierarchy for the current user.
+	 * One tiny indexed query, cheaper than a Redis round-trip, so not cached.
+	 * @return array<int, int> mapping cat_id => parent_cat (0 for root)
 	 */
-	private function get_cached_cat_hierarchy(): array {
-		$key = $this->cache_key('cat_hierarchy');
-		$cached = $this->get_cached($key);
-
-		if ($cached !== null) return $cached;
-
+	private function _cat_hierarchy(): array {
 		$uid = $_SESSION['uid'] ?? 0;
 		$cats = ORM::for_table('ttrss_feed_categories')
 			->select_many('id', 'parent_cat')
@@ -329,26 +317,15 @@ class Redis_Cache extends Plugin implements IHandler {
 
 		$hierarchy = [];
 		foreach ($cats as $cat) {
-			$hierarchy[(string) $cat->id] = (int) ($cat->parent_cat ?? 0);
+			$hierarchy[(int) $cat->id] = (int) ($cat->parent_cat ?? 0);
 		}
-
-		$this->set_cached($key, $hierarchy, $this->ttl(self::REDIS_FEED_TREE_TTL));
 
 		return $hierarchy;
 	}
 
 	/**
-	 * Get child category IDs from cached hierarchy (no recursive SQL).
-	 * @return array<int, int>
-	 */
-	private function get_cached_child_cats(int $cat_id): array {
-		$hierarchy = $this->get_cached_cat_hierarchy();
-		return $this->_resolve_children($cat_id, $hierarchy);
-	}
-
-	/**
 	 * Recursively resolve child categories from hierarchy map.
-	 * @param array<string, int> $hierarchy
+	 * @param array<int, int> $hierarchy
 	 * @return array<int, int>
 	 */
 	private function _resolve_children(int $cat_id, array $hierarchy): array {
@@ -364,9 +341,9 @@ class Redis_Cache extends Plugin implements IHandler {
 	}
 
 	/**
-	 * Cache feed icon existence for all feeds of the current user.
-	 * Eliminates per-feed file_exists() calls on cache rebuild.
-	 * @return array<string, bool> mapping feed_id => has_icon
+	 * Cache feed icon mtimes for all feeds of the current user.
+	 * Eliminates per-feed file_exists()/filemtime() calls on counters rebuild.
+	 * @return array<string, int> mapping feed_id => icon mtime (0 if no icon)
 	 */
 	private function get_cached_feed_icons(): array {
 		$key = $this->cache_key('feed_icons');
@@ -382,12 +359,142 @@ class Redis_Cache extends Plugin implements IHandler {
 
 		$icons = [];
 		foreach ($feeds as $feed) {
-			$icons[(string) $feed->id] = Feeds::_has_icon($feed->id);
+			$icons[(string) $feed->id] = Feeds::_has_icon($feed->id)
+				? (int) filemtime(Feeds::_get_icon_file($feed->id))
+				: 0;
 		}
 
 		$this->set_cached($key, $icons, $this->ttl(self::REDIS_FEED_ICONS_TTL));
 
 		return $icons;
+	}
+
+	// -- Counters rebuild using cached helpers --
+
+	/**
+	 * Mirrors Counters::get_all() but builds feed and category counters with
+	 * cached icon mtimes and PHP-side child category aggregation, avoiding
+	 * per-feed file_exists() calls and per-category recursive count queries.
+	 * @return array<int, array<string, int|string>>
+	 */
+	private function _build_counters(): array {
+		$global = (new ReflectionMethod('Counters', 'get_global'))->invoke(null);
+		$virt = (new ReflectionMethod('Counters', 'get_virt'))->invoke(null);
+
+		return [
+			...$global,
+			...$virt,
+			...Counters::get_labels(),
+			...$this->_feed_counters(),
+			...$this->_cat_counters(),
+		];
+	}
+
+	/**
+	 * Mirrors Counters::get_feeds() using cached icon mtimes for 'ts'.
+	 * @return array<int, array{id: int, title: string, error: string, updated: string, counter: int, markedcounter: int, publishedcounter: int, ts: int}>
+	 */
+	private function _feed_counters(): array {
+		$ret = [];
+		$icon_ts = $this->get_cached_feed_icons();
+
+		$feeds = ORM::for_table('ttrss_feeds')
+			->table_alias('f')
+			->select_many('f.id', 'f.title', 'f.last_error')
+			->select_many_expr([
+				'count' => 'SUM(CASE WHEN ue.unread THEN 1 ELSE 0 END)',
+				'count_marked' => 'SUM(CASE WHEN ue.marked THEN 1 ELSE 0 END)',
+				'count_published' => 'SUM(CASE WHEN ue.published THEN 1 ELSE 0 END)',
+				'last_updated' => 'SUBSTRING_FOR_DATE(f.last_updated,1,19)',
+			])
+			->join('ttrss_user_entries', ['ue.feed_id', '=', 'f.id'], 'ue')
+			->where('ue.owner_uid', $_SESSION['uid'])
+			->group_by('f.id');
+
+		foreach ($feeds->find_many() as $feed) {
+			$ret[] = [
+				'id' => $feed->id,
+				'title' => truncate_string($feed->title, 30),
+				'error' => $feed->last_error,
+				'updated' => TimeHelper::make_local_datetime($feed->last_updated),
+				'counter' => (int) $feed->count,
+				'markedcounter' => (int) $feed->count_marked,
+				'publishedcounter' => (int) $feed->count_published,
+				'ts' => $icon_ts[(string) $feed->id] ?? 0,
+			];
+		}
+
+		return $ret;
+	}
+
+	/**
+	 * Mirrors Counters::get_cats() but aggregates child category counts in PHP
+	 * from the cached hierarchy instead of recursive per-category count queries.
+	 * @return array<int, array{id: int, kind: 'cat', counter: int, markedcounter?: int, publishedcounter?: int}>
+	 */
+	private function _cat_counters(): array {
+		$hierarchy = $this->_cat_hierarchy();
+
+		$ret = [
+			[
+				'id' => Feeds::CATEGORY_LABELS,
+				'kind' => 'cat',
+				'counter' => Feeds::_get_cat_unread(Feeds::CATEGORY_LABELS),
+			],
+		];
+
+		$pdo = Db::pdo();
+
+		$sth = $pdo->prepare("SELECT fc.id,
+				SUM(CASE WHEN unread THEN 1 ELSE 0 END) AS count,
+				SUM(CASE WHEN marked THEN 1 ELSE 0 END) AS count_marked,
+				SUM(CASE WHEN published THEN 1 ELSE 0 END) AS count_published
+			FROM ttrss_feed_categories fc
+				LEFT JOIN ttrss_feeds f ON (f.cat_id = fc.id)
+				LEFT JOIN ttrss_user_entries ue ON (ue.feed_id = f.id)
+			WHERE fc.owner_uid = :uid
+			GROUP BY fc.id
+		UNION
+			SELECT 0,
+				SUM(CASE WHEN unread THEN 1 ELSE 0 END) AS count,
+				SUM(CASE WHEN marked THEN 1 ELSE 0 END) AS count_marked,
+				SUM(CASE WHEN published THEN 1 ELSE 0 END) AS count_published
+			FROM ttrss_feeds f, ttrss_user_entries ue
+			WHERE f.cat_id IS NULL AND
+				ue.feed_id = f.id AND
+				ue.owner_uid = :uid");
+
+		$sth->execute(['uid' => $_SESSION['uid']]);
+
+		$direct = [];
+		while ($line = $sth->fetch()) {
+			$direct[(int) $line['id']] = [
+				'counter' => (int) $line['count'],
+				'markedcounter' => (int) $line['count_marked'],
+				'publishedcounter' => (int) $line['count_published'],
+			];
+		}
+
+		foreach ($direct as $cat_id => $counts) {
+			// cat_id 0 is Uncategorized, never a parent in the hierarchy
+			if ($cat_id != 0) {
+				foreach ($this->_resolve_children($cat_id, $hierarchy) as $child_id) {
+					$counts['counter'] += $direct[$child_id]['counter'] ?? 0;
+					$counts['markedcounter'] += $direct[$child_id]['markedcounter'] ?? 0;
+					$counts['publishedcounter'] += $direct[$child_id]['publishedcounter'] ?? 0;
+				}
+			}
+
+			$ret[] = [
+				'id' => $cat_id,
+				'kind' => 'cat',
+				'markedcounter' => $counts['markedcounter'],
+				'publishedcounter' => $counts['publishedcounter'],
+				'counter' => $counts['counter'],
+			];
+		}
+
+		return $ret;
 	}
 
 	// -- Cached RPC methods --
@@ -418,7 +525,7 @@ class Redis_Cache extends Plugin implements IHandler {
 		$counters = $this->get_cached($key);
 
 		if ($counters === null) {
-			$counters = Counters::get_all();
+			$counters = $this->_build_counters();
 			$this->set_cached($key, $counters, $this->ttl(self::REDIS_COUNTERS_TTL));
 		}
 
@@ -430,7 +537,8 @@ class Redis_Cache extends Plugin implements IHandler {
 
 	/**
 	 * Cached version of RPC::sanityCheck().
-	 * Caches translations (24h), init params (5min), and runtime info (10s).
+	 * Caches init params (5min) and runtime info (10s). Translations are
+	 * built from the in-memory gettext catalog, no I/O, nothing to cache.
 	 */
 	function sanitycheck(): void {
 		$_SESSION['hasSandbox'] = Handler::_param_to_bool($_REQUEST['hasSandbox'] ?? false);
@@ -460,14 +568,8 @@ class Redis_Cache extends Plugin implements IHandler {
 
 		$rpc = new RPC($this->handler_args);
 
-		$translations_key = $this->cache_key('translations');
-		$translations = $this->get_cached($translations_key);
-
-		if ($translations === null) {
-			$ref = new ReflectionMethod($rpc, '_translations_as_array');
-			$translations = $ref->invoke($rpc);
-			$this->set_cached($translations_key, $translations, $this->ttl(self::REDIS_TRANSLATIONS_TTL));
-		}
+		$ref = new ReflectionMethod($rpc, '_translations_as_array');
+		$translations = $ref->invoke($rpc);
 
 		$init_params_key = $this->cache_key('init_params');
 		$init_params = $this->get_cached($init_params_key);
@@ -488,18 +590,51 @@ class Redis_Cache extends Plugin implements IHandler {
 	}
 
 	/**
+	 * Delegate to the original handler, invalidate caches, then send the
+	 * captured response, so a follow-up request arriving right after the
+	 * response can't hit keys that are about to be invalidated.
+	 */
+	private function delegate_capture_and_invalidate(string $class, string $method, string ...$types): void {
+		$handler = new $class($this->handler_args);
+
+		ob_start();
+		$handler->$method();
+		$output = ob_get_clean();
+
+		$this->invalidate(...$types);
+
+		print $output;
+	}
+
+	/**
 	 * Intercept RPC::catchupFeed to invalidate view/counter caches after catchup.
 	 */
 	function catchupfeed(): void {
-		$handler = new RPC($this->handler_args);
+		$this->delegate_capture_and_invalidate('RPC', 'catchupFeed', 'counters', 'view:*', 'runtime_info');
+	}
 
-		ob_start();
-		$handler->catchupFeed();
-		$output = ob_get_clean();
+	/**
+	 * RPC::catchupSelected marks articles read via Article::_catchup_by_id,
+	 * which fires no plugin hook, without this override the counters/view
+	 * caches serve stale data after every read-state change (article open,
+	 * CDM scroll auto-catchup, next/prev navigation).
+	 */
+	function catchupselected(): void {
+		$this->delegate_capture_and_invalidate('RPC', 'catchupSelected', 'counters', 'view:*', 'runtime_info');
+	}
 
-		$this->invalidate('counters', 'view:*', 'runtime_info');
+	/**
+	 * RPC::delete removes user entries without firing a plugin hook.
+	 */
+	function delete(): void {
+		$this->delegate_capture_and_invalidate('RPC', 'delete', 'counters', 'view:*', 'runtime_info');
+	}
 
-		print $output;
+	/**
+	 * Feeds::catchupAll marks everything read without firing a plugin hook.
+	 */
+	function catchupall(): void {
+		$this->delegate_capture_and_invalidate('Feeds', 'catchupAll', 'counters', 'view:*', 'runtime_info');
 	}
 
 	// -- Cached Feeds methods --
@@ -594,7 +729,7 @@ class Redis_Cache extends Plugin implements IHandler {
 			$search = clean($_REQUEST['search'] ?? '');
 		}
 
-		$key = $this->cache_key('feedtree:' . $mode . ':' . sha1($search));
+		$key = $this->cache_key('feedtree:' . $mode . ':' . hash('xxh3', $search));
 		$cached = $this->get_cached($key);
 
 		if ($cached !== null) {
@@ -618,7 +753,7 @@ class Redis_Cache extends Plugin implements IHandler {
 	// -- Feed tree invalidation on structure changes --
 
 	private function delegate_with_tree_invalidation(string $class, string $method): void {
-		$this->delegate_and_invalidate($class, $method, 'feedtree:*', 'counters', 'runtime_info', 'cat_hierarchy', 'feed_icons');
+		$this->delegate_and_invalidate($class, $method, 'feedtree:*', 'counters', 'runtime_info', 'feed_icons');
 	}
 
 	function remove(): void {
@@ -666,7 +801,7 @@ class Redis_Cache extends Plugin implements IHandler {
 	function setpref(): void {
 		$handler = new RPC($this->handler_args);
 		$handler->setpref();
-		$this->invalidate_pref_dependent_caches(clean($_REQUEST['key'] ?? '') === Prefs::USER_LANGUAGE);
+		$this->invalidate_pref_dependent_caches();
 	}
 
 	function setwidescreen(): void {
@@ -678,7 +813,7 @@ class Redis_Cache extends Plugin implements IHandler {
 	function saveconfig(): void {
 		$handler = new Pref_Prefs($this->handler_args);
 		$handler->saveconfig();
-		$this->invalidate_pref_dependent_caches(true);
+		$this->invalidate_pref_dependent_caches();
 	}
 
 	// -- Label assignment invalidation --
@@ -894,10 +1029,6 @@ class Redis_Cache extends Plugin implements IHandler {
 				<tr>
 					<td><?= __('Icon') ?></td>
 					<td><?= Config::get(self::REDIS_FEED_ICONS_TTL) ?>s</td>
-				</tr>
-				<tr>
-					<td><?= __('Translations') ?></td>
-					<td><?= Config::get(self::REDIS_TRANSLATIONS_TTL) ?>s</td>
 				</tr>
 			</table>
 
